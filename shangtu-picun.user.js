@@ -1,18 +1,29 @@
 // ==UserScript==
-// @name         京图批存
-// @namespace    https://github.com/WenLiux/jingtu-picun
-// @version      1.4.4
-// @description  一键下载京东商品详情页的全部详情图，批量下载只需选择一次保存文件夹
+// @name         商图批存（京东/天猫/淘宝）
+// @namespace    https://github.com/WenLiux/shangtu-picun
+// @version      1.5.3
+// @description  一键下载京东、天猫和淘宝商品详情页的全部详情图，批量下载只需选择一次保存文件夹
 // @author       Wenl
-// @homepageURL  https://github.com/WenLiux/jingtu-picun
-// @supportURL   https://github.com/WenLiux/jingtu-picun/issues
+// @homepageURL  https://github.com/WenLiux/shangtu-picun
+// @supportURL   https://github.com/WenLiux/shangtu-picun/issues
 // @match        https://item.jd.com/*.html
 // @match        https://item.jd.com/*
+// @match        https://detail.tmall.com/item.htm*
+// @match        https://item.taobao.com/item.htm*
 // @grant        GM_xmlhttpRequest
-// @grant        GM_download
 // @grant        unsafeWindow
 // @connect      in.m.jd.com
-// @connect      *.360buyimg.com
+// @connect      img1.360buyimg.com
+// @connect      img10.360buyimg.com
+// @connect      img11.360buyimg.com
+// @connect      img12.360buyimg.com
+// @connect      img13.360buyimg.com
+// @connect      img14.360buyimg.com
+// @connect      img20.360buyimg.com
+// @connect      img30.360buyimg.com
+// @connect      img.alicdn.com
+// @connect      gw.alicdn.com
+// @connect      assets.alicdn.com
 // @license      CC-BY-NC-SA-4.0
 // ==/UserScript==
 
@@ -20,15 +31,33 @@
   'use strict';
 
   // ====================
-  // 提取 SKU ID
+  // 识别平台并提取商品 ID
   // ====================
-  function getSkuId() {
-    const match = location.pathname.match(/(\d+)\.html/);
-    return match ? match[1] : null;
+  function detectPlatform() {
+    if (location.hostname === 'item.jd.com') return 'jd';
+    if (location.hostname === 'detail.tmall.com') return 'tmall';
+    if (location.hostname === 'item.taobao.com') return 'taobao';
+    return null;
   }
 
-  const SKU_ID = getSkuId();
-  if (!SKU_ID) return;
+  function getProductId(platform) {
+    if (platform === 'jd') {
+      const match = location.pathname.match(/(\d+)\.html/);
+      return match ? match[1] : null;
+    }
+    return new URLSearchParams(location.search).get('id');
+  }
+
+  const PLATFORM = detectPlatform();
+  const PRODUCT_ID = getProductId(PLATFORM);
+  if (!PLATFORM || !PRODUCT_ID || !/^\d+$/.test(PRODUCT_ID)) return;
+
+  const PLATFORM_NAME = {
+    jd: '京东',
+    tmall: '天猫',
+    taobao: '淘宝',
+  }[PLATFORM];
+  const PAGE_REFERER = `${location.origin}/`;
 
   const DOWNLOAD_CONCURRENCY = 3;
   const DOWNLOAD_RETRIES = 2;
@@ -331,15 +360,52 @@
   // ====================
   // 核心：获取详情图 URL 列表
   // ====================
-  function fetchImageUrls() {
-    const graphextUrl = `https://in.m.jd.com/product/graphext/${SKU_ID}.html`;
+  function normalizeImageUrl(url) {
+    if (!url) return null;
+    const normalized = String(url).trim().replace(/&amp;/gi, '&');
+    if (!normalized || /^(?:data|blob):/i.test(normalized)) return null;
+    if (normalized.startsWith('//')) return `https:${normalized}`;
+    try {
+      return new URL(normalized, location.href).href;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function inferImageExtension(url) {
+    const path = url.replace(/[?#].*$/, '');
+    const matches = [...path.matchAll(/\.(jpe?g|png|gif|webp|avif)(?=\.|_|$)/gi)];
+    if (matches.length === 0) return 'jpg';
+    const extension = matches[matches.length - 1][1].toLowerCase();
+    return extension === 'jpeg' ? 'jpg' : extension;
+  }
+
+  function buildImageInfos(urls) {
+    const seen = new Set();
+    return urls
+      .map(normalizeImageUrl)
+      .filter(Boolean)
+      .filter(url => {
+        const key = url.replace(/\?.*$/, '');
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .map((url, index) => ({
+        url,
+        name: `${PRODUCT_ID}_detail_${String(index + 1).padStart(2, '0')}.${inferImageExtension(url)}`,
+      }));
+  }
+
+  function fetchJdImageUrls() {
+    const graphextUrl = `https://in.m.jd.com/product/graphext/${PRODUCT_ID}.html`;
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: 'GET',
         url: graphextUrl,
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-          'Referer': 'https://item.jd.com/',
+          'Referer': PAGE_REFERER,
         },
         onload(resp) {
           if (resp.status !== 200) {
@@ -355,27 +421,7 @@
             reject(new Error('未找到详情图，该商品可能没有图片描述'));
             return;
           }
-          // 去重并保留页面顺序。SKU 前缀可防止不同商品的图片重名。
-          const seen = new Set();
-          const urls = matches
-            .map(u => u.startsWith('//') ? `https:${u}` : u)
-            .filter(u => {
-              const key = u.replace(/\?.*$/, '');
-              if (seen.has(key)) return false;
-              seen.add(key);
-              return true;
-            })
-            .map((u, i) => {
-              const extensionMatch = u.replace(/\?.*$/, '').match(/\.(jpe?g|png|webp)(?:\.dpg)?$/i);
-              const extension = extensionMatch && extensionMatch[1].toLowerCase() === 'jpeg'
-                ? 'jpg'
-                : (extensionMatch ? extensionMatch[1].toLowerCase() : 'jpg');
-              return {
-                url: u,
-                name: `${SKU_ID}_detail_${String(i + 1).padStart(2, '0')}.${extension}`,
-              };
-            });
-          resolve(urls);
+          resolve(buildImageInfos(matches));
         },
         onerror(err) {
           reject(new Error('网络请求失败，请检查网络连接'));
@@ -386,6 +432,77 @@
         timeout: 15000,
       });
     });
+  }
+
+  const TMALL_DETAIL_SELECTORS = [
+    '#imageTextInfo-content',
+    '#J_DivItemDesc',
+    '.desc-root',
+    '.descV8-container',
+    '.tb-desc-content',
+  ];
+
+  function findTmallDetailRoot() {
+    for (const selector of TMALL_DETAIL_SELECTORS) {
+      const root = $(selector);
+      if (root) return root;
+    }
+    return null;
+  }
+
+  function readElementImageUrl(img) {
+    const srcset = img.getAttribute('data-srcset') || img.getAttribute('srcset');
+    const srcsetUrl = srcset && srcset.split(',').pop().trim().split(/\s+/)[0];
+    return img.getAttribute('data-src')
+      || img.getAttribute('data-ks-lazyload')
+      || img.getAttribute('data-original')
+      || srcsetUrl
+      || img.currentSrc
+      || img.src;
+  }
+
+  function filterTmallPlatformAssets(urls) {
+    const ownerCounts = new Map();
+    urls.forEach(url => {
+      const match = String(url).match(/!!(\d+)/);
+      if (match) ownerCounts.set(match[1], (ownerCounts.get(match[1]) || 0) + 1);
+    });
+    const dominantOwner = [...ownerCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .find(([, count]) => count >= 2)?.[0];
+
+    if (!dominantOwner) return urls;
+    return urls.filter(url => {
+      const ownerMatch = String(url).match(/!!(\d+)/);
+      if (!ownerMatch || ownerMatch[1] === dominantOwner) return true;
+      return !/!!600000000\d+-2-tps-/i.test(String(url));
+    });
+  }
+
+  async function fetchTmallImageUrls() {
+    const deadline = Date.now() + 15000;
+    let root;
+
+    while (Date.now() < deadline) {
+      root = findTmallDetailRoot();
+      if (root) {
+        const urls = filterTmallPlatformAssets(
+          $$('img', root).map(readElementImageUrl).filter(Boolean),
+        );
+        const images = buildImageInfos(urls);
+        if (images.length > 0) return images;
+      }
+      await wait(300);
+    }
+
+    if (!root) {
+      throw new Error('未找到图文详情区域，请确认商品详情已加载完成');
+    }
+    throw new Error('图文详情区域中没有可下载的图片');
+  }
+
+  function fetchImageUrls() {
+    return PLATFORM === 'jd' ? fetchJdImageUrls() : fetchTmallImageUrls();
   }
 
   // ====================
@@ -402,7 +519,7 @@
 
     // Header
     const header = createEl('div', { class: 'jd-dl-header' }, [
-      createEl('h2', {}, [`京图批存 · 详情图 ${imageUrls.length} 张 · 商品 ID: ${SKU_ID}`]),
+      createEl('h2', {}, [`商图批存 · ${PLATFORM_NAME}详情图 ${imageUrls.length} 张 · 商品 ID: ${PRODUCT_ID}`]),
       createEl('div', { class: 'jd-dl-header-actions' }, [
         createEl('button', {
           class: 'jd-dl-btn-zip',
@@ -474,38 +591,32 @@
   }
 
   // ====================
-  // 将 GM_download 包装为可超时、可重试的 Promise。
+  // 单张下载使用已校验的原始字节，避免 CDN 返回格式与 URL 后缀不一致。
   // ====================
-  function runDownload(imgInfo) {
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      let task;
-      const finish = (error) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        if (error) reject(error);
-        else resolve();
-      };
-      const timer = setTimeout(() => {
-        if (task && typeof task.abort === 'function') task.abort();
-        finish(new Error('下载超时'));
-      }, DOWNLOAD_TIMEOUT);
+  function replaceImageExtension(name, extension) {
+    return name.replace(/\.[^.]+$/, `.${extension}`);
+  }
 
-      try {
-        task = GM_download({
-          url: imgInfo.url,
-          name: imgInfo.name,
-          headers: { Referer: 'https://item.jd.com/' },
-          saveAs: false,
-          onload: () => finish(),
-          onerror: (err) => finish(new Error(err && (err.error || err.details) || '下载失败')),
-          ontimeout: () => finish(new Error('下载超时')),
-        });
-      } catch (err) {
-        finish(err);
-      }
+  function triggerBrowserDownload(data, name, extension) {
+    const mimeTypes = {
+      jpg: 'image/jpeg',
+      png: 'image/png',
+      gif: 'image/gif',
+      webp: 'image/webp',
+      avif: 'image/avif',
+    };
+    const blobUrl = URL.createObjectURL(new Blob([data], {
+      type: mimeTypes[extension] || 'application/octet-stream',
+    }));
+    const link = createEl('a', {
+      href: blobUrl,
+      download: name,
+      style: { display: 'none' },
     });
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 30000);
   }
 
   function wait(ms) {
@@ -516,8 +627,7 @@
     let lastError;
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
-        await runDownload(imgInfo);
-        return;
+        return await fetchImageData(imgInfo);
       } catch (err) {
         lastError = err;
         if (attempt < retries) await wait(600 * (attempt + 1));
@@ -531,11 +641,13 @@
   // ====================
   async function downloadSingle(imgInfo) {
     try {
-      await downloadWithRetry(imgInfo);
-      toast(`${imgInfo.name} 下载完成`, 'success');
+      const result = await downloadWithRetry(imgInfo);
+      const actualName = replaceImageExtension(imgInfo.name, result.extension);
+      triggerBrowserDownload(result.data, actualName, result.extension);
+      toast(`${actualName} 下载完成`, 'success');
     } catch (err) {
       toast(`下载失败: ${imgInfo.name}`, 'error');
-      console.error('[JD DL] GM_download error:', err);
+      console.error('[DETAIL DL] 单张下载失败:', err);
     }
   }
 
@@ -544,7 +656,7 @@
   // ====================
   async function pickDownloadDirectory() {
     const options = {
-      id: 'jd-detail-images',
+      id: 'ecommerce-detail-images',
       mode: 'readwrite',
       startIn: 'downloads',
     };
@@ -558,21 +670,38 @@
     throw new Error('当前浏览器不支持文件夹批量保存，请使用最新版 Chrome 或 Edge');
   }
 
-  function isImageData(buffer) {
+  function detectImageExtension(buffer) {
     const bytes = new Uint8Array(buffer, 0, Math.min(buffer.byteLength, 12));
     const isJpeg = bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
     const isPng = bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47;
     const isWebp = bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46
       && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50;
-    return isJpeg || isPng || isWebp;
+    const isGif = bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46
+      && bytes[3] === 0x38 && (bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61;
+    const isAvif = bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70
+      && bytes[8] === 0x61 && bytes[9] === 0x76 && bytes[10] === 0x69 && bytes[11] === 0x66;
+    if (isJpeg) return 'jpg';
+    if (isPng) return 'png';
+    if (isWebp) return 'webp';
+    if (isGif) return 'gif';
+    if (isAvif) return 'avif';
+    return null;
   }
 
   function fetchImageData(imgInfo) {
+    const imageHost = (() => {
+      try {
+        return new URL(imgInfo.url).hostname;
+      } catch (_) {
+        return '未知域名';
+      }
+    })();
+
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: 'GET',
         url: imgInfo.url,
-        headers: { Referer: 'https://item.jd.com/' },
+        headers: { Referer: PAGE_REFERER },
         responseType: 'arraybuffer',
         timeout: DOWNLOAD_TIMEOUT,
         async onload(resp) {
@@ -592,26 +721,31 @@
             if (!data || typeof data.byteLength !== 'number' || data.byteLength === 0) {
               throw new Error('图片响应为空');
             }
-            if (!isImageData(data)) {
+            const extension = detectImageExtension(data);
+            if (!extension) {
               throw new Error('服务器返回的不是有效图片');
             }
-            resolve(data);
+            resolve({ data, extension });
           } catch (err) {
             reject(err);
           }
         },
-        onerror: () => reject(new Error('图片请求失败')),
+        onerror: event => {
+          const detail = event && (event.error || event.statusText);
+          reject(new Error(`图片请求失败（${imageHost}）${detail ? `：${detail}` : ''}`));
+        },
         ontimeout: () => reject(new Error('图片请求超时')),
       });
     });
   }
 
   async function saveImageToDirectory(imgInfo, directoryHandle) {
-    const data = await fetchImageData(imgInfo);
-    const fileHandle = await directoryHandle.getFileHandle(imgInfo.name, { create: true });
+    const result = await fetchImageData(imgInfo);
+    const actualName = replaceImageExtension(imgInfo.name, result.extension);
+    const fileHandle = await directoryHandle.getFileHandle(actualName, { create: true });
     const writable = await fileHandle.createWritable();
     try {
-      await writable.write(data);
+      await writable.write(result.data);
       await writable.close();
     } catch (err) {
       if (typeof writable.abort === 'function') {
@@ -621,9 +755,10 @@
     }
 
     const savedFile = await fileHandle.getFile();
-    if (savedFile.size !== data.byteLength) {
-      throw new Error(`写入校验失败: ${savedFile.size}/${data.byteLength} 字节`);
+    if (savedFile.size !== result.data.byteLength) {
+      throw new Error(`写入校验失败: ${savedFile.size}/${result.data.byteLength} 字节`);
     }
+    return actualName;
   }
 
   async function saveToDirectoryWithRetry(imgInfo, directoryHandle, retries = DOWNLOAD_RETRIES) {
@@ -658,7 +793,7 @@
         toast('已取消批量下载', 'error');
       } else {
         toast(err.message || '无法选择保存文件夹', 'error');
-        console.error('[JD DL] 选择文件夹失败:', err);
+        console.error('[DETAIL DL] 选择文件夹失败:', err);
       }
       return;
     }
@@ -677,7 +812,7 @@
           succeeded++;
         } catch (err) {
           failures.push({ img, error: err });
-          console.error(`[JD DL] ${img.name} 下载失败:`, err);
+          console.error(`[DETAIL DL] ${img.name} 下载失败:`, err);
         } finally {
           completed++;
           btnEl.textContent = `下载中 ${completed}/${total}`;
@@ -712,7 +847,7 @@
       createEl('div', { class: 'jd-dl-loading' }, [
         createEl('div', { class: 'jd-dl-spinner' }),
         createEl('span', {}, ['正在获取详情图列表...']),
-        createEl('span', { style: { fontSize: '12px', color: '#666' } }, [`商品 ID: ${SKU_ID}`]),
+        createEl('span', { style: { fontSize: '12px', color: '#666' } }, [`${PLATFORM_NAME}商品 ID: ${PRODUCT_ID}`]),
       ]),
     ]);
     overlay.appendChild(panel);
@@ -795,5 +930,5 @@
     injectButton();
   }
 
-  console.log(`[京图批存 · Wenl] 已就绪 | 商品 ID: ${SKU_ID} | 点击右下角红色按钮下载详情图`);
+  console.log(`[商图批存 · Wenl] 已就绪 | ${PLATFORM_NAME}商品 ID: ${PRODUCT_ID} | 点击右下角红色按钮下载详情图`);
 })();
